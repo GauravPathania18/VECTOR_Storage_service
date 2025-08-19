@@ -76,15 +76,25 @@ class VectorStore:
             query_embeddings=[query_vector],
             n_results=top_k
         )
-
+    # # 🔹 safe reset
+    # def reset_collection_soft(self):
+    #     """Delete all vectors from collection without dropping it."""
+    #     page = self.collection.get(include=[], limit=None)
+    #     ids = page.get("ids", [])
+    #     if ids:
+    #         self.collection.delete(ids=ids)
+    #     self.expected_dimension = None
+    #     logging.info("🧹 Soft reset: deleted %d items", len(ids))
+    #     return len(ids)
+    
 # Create a single global instance of VectorStore
 vector_store = VectorStore()
 # --- Reset collection for fresh embeddings (temporary, for testing) ---
-all_docs = vector_store.collection.get()
-ids_to_delete = all_docs['ids']  # list of all stored IDs
-if ids_to_delete:
-    vector_store.collection.delete(ids=ids_to_delete)
-vector_store.expected_dimension = None
+# all_docs = vector_store.collection.get()
+# ids_to_delete = all_docs['ids']  # list of all stored IDs
+# if ids_to_delete:
+#     vector_store.collection.delete(ids=ids_to_delete)
+# vector_store.expected_dimension = None
 
 # -------------------------------------------------
 # Request Models
@@ -109,7 +119,18 @@ class QueryRequest(BaseModel):
     query: str
     top_k: Optional[int] = 5
 
-
+# -------------------------------------------------
+# Text Cleaning
+# -------------------------------------------------
+def clean_user_text(raw_text: str) -> str:
+    """
+    Clean raw user input:
+    - Replace newlines with spaces
+    - Strip extra whitespace
+    """
+    if not raw_text:
+        return ""
+    return " ".join(raw_text.split())
 
 # -------------------------------------------------
 # External Embedder API
@@ -146,6 +167,11 @@ def get_embedding(text: str) -> List[float]:
 # API Endpoints
 # -------------------------------------------------
 
+@app.get("/")
+def root():
+    return {"message": "Vector Storage Service is running 🚀"}
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -157,9 +183,12 @@ def add_text(req: TextRequest):
     Accept raw text + optional metadata, generate embedding via embedder, and store in ChromaDB.
     """
     try:
+        # 🧹 Clean raw text before embedding
+        clean_text = clean_user_text(req.text)
+
         logging.info(f"📝 /add_text called with text='{req.text[:30]}...'")
 
-        vector = get_embedding(req.text)# <-- calls embedder
+        vector = get_embedding(clean_text)# <-- calls embedder
 
         # Store vector with metadata
         metadata = req.metadata or {"text": req.text}
@@ -219,10 +248,20 @@ def query_text(req: QueryRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.post("/reset")
-def reset_collection():
+@app.post("/reset_hard")
+def reset_collection_hard():
+    """
+    Completely reset ChromaDB collection (including wrong dimension).
+    """
     try:
-        vector_store.reset_collection()
-        return {"status": "success", "message": "Collection reset successfully."}
+        # Delete by name used in __init__
+        vector_store.client.delete_collection(name="personal_llm")
+        # Recreate same collection
+        vector_store.collection = vector_store.client.create_collection(name="personal_llm")
+
+        vector_store.expected_dimension = None
+        return {"status": "success", "message": "Hard reset: collection deleted and recreated."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
