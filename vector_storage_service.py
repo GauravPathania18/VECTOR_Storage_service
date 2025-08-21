@@ -265,3 +265,4 @@ def reset_collection_hard():
         return {"status": "error", "message": str(e)}
 
 
+
