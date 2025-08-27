@@ -6,7 +6,8 @@ import chromadb
 import uuid
 import logging
 import requests
-
+import subprocess
+import json
 # -------------------------------------------------
 # FastAPI App Initialization
 # -------------------------------------------------
@@ -19,7 +20,7 @@ app = FastAPI(
 # -------------------------------------------------
 # Logging Setup
 # -------------------------------------------------
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -------------------------------------------------
 # Vector Store Logic
@@ -76,6 +77,8 @@ class VectorStore:
             query_embeddings=[query_vector],
             n_results=top_k
         )
+    
+
     # # 🔹 safe reset
     # def reset_collection_soft(self):
     #     """Delete all vectors from collection without dropping it."""
@@ -89,6 +92,7 @@ class VectorStore:
     
 # Create a single global instance of VectorStore
 vector_store = VectorStore()
+
 # --- Reset collection for fresh embeddings (temporary, for testing) ---
 # all_docs = vector_store.collection.get()
 # ids_to_delete = all_docs['ids']  # list of all stored IDs
@@ -110,6 +114,7 @@ class TextRequest(BaseModel):
            Store the vector in ChromaDB.'''
     text: str
     metadata: Optional[Dict] = None 
+    model: Optional[str] = "mistral"  # metadata generator model
     
 class SearchRequest(BaseModel):
     vector: List[float]
@@ -163,6 +168,54 @@ def get_embedding(text: str) -> List[float]:
         logging.error(f"[Embedder] Invalid response format: {e}, response={resp.text}")
         raise HTTPException(status_code=500, detail=f"Embedder response error: {e}")
 
+def normalize_metadata(meta: dict) -> dict:
+    normalized = {}
+    for k, v in meta.items():
+        if isinstance(v, list):
+            # store lists as comma-separated string
+            normalized[k] = ", ".join(map(str, v))
+        elif isinstance(v, dict):
+            # if nested dict, flatten it too
+            normalized[k] = json.dumps(v)
+        else:
+            normalized[k] = v
+        
+    return normalized
+    
+# -------------------------------------------------
+# Metadata Generator (via Ollama + Mistral/LLaMA)
+# -------------------------------------------------
+def generate_metadata(text: str, model: str = "mistral") -> dict:
+    prompt = f"""
+    Analyze the following text and generate metadata in strict JSON format.
+    Fields:
+    - title: short descriptive title
+    - summary: concise summary
+    - keywords: list of 3-5 important keywords
+    - category: broad category/topic
+
+    Text:
+    {text}
+    """
+
+    result = subprocess.run(
+        ["ollama", "run", model],
+        input=prompt,
+        text=True,
+        capture_output=True
+    )
+    raw = result.stdout.strip()
+    try:
+         # Try to extract valid JSON from messy LLM output
+        json_start = raw.find("{")
+        json_end = raw.rfind("}")
+        if json_start != -1 and json_end != -1:
+            return json.loads(raw[json_start:json_end+1])
+        return {"raw_output": raw}
+    except Exception as e:
+        logging.warning(f"[Metadata] Failed to parse JSON. Error={e}, raw={raw}")
+        return {"raw_output": raw}
+    
 # -------------------------------------------------
 # API Endpoints
 # -------------------------------------------------
@@ -189,15 +242,25 @@ def add_text(req: TextRequest):
         logging.info(f"📝 /add_text called with text='{req.text[:30]}...'")
 
         vector = get_embedding(clean_text)# <-- calls embedder
+        
+        # Generate metadata from LLM
+        llm_metadata = generate_metadata(clean_text, req.model)
 
-        # Store vector with metadata
-        metadata = req.metadata or {"text": req.text}
+        # Merge user-provided metadata with generated metadata
+        metadata = {**(req.metadata or {}), **(llm_metadata)}
+        metadata["text"] = req.text  # always store original text
+        # ✅ Normalize before storing
+        metadata = normalize_metadata(metadata)
+        '''# Store vector with metadata
+        metadata = req.metadata or {"text": req.text}'''
+
         doc_id = vector_store.store_vector(vector, metadata)
 
         return {
             "status": "success", 
             "id": doc_id, 
-            "text": req.text
+            "text": req.text,
+            "metadata":metadata
         }
     except HTTPException as e:
         # Pass through HTTP errors from get_embedding
@@ -207,16 +270,28 @@ def add_text(req: TextRequest):
         return {"status": "error", "message": str(e)}
     
 @app.get("/vectors")
-def get_vectors(limit: Optional[int] = None):
-    """
-    Fetch stored vectors (with optional limit).
-    """
-    try:
-        logging.info(f"📤 /vectors called with limit={limit}")
-        results = vector_store.get_all(limit=limit)
-        return {"status": "success", "data": results}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+async def list_vectors():
+    items = vector_store.collection.get()
+    results = []
+
+    for i in range(len(items["ids"])):
+        results.append({
+            "id": items["ids"][i],
+            "document": items["documents"][i],
+            "metadata": items["metadatas"][i],   # ✅ include metadata
+            # "embedding": None   # keep excluded (too large)
+        })
+# def get_vectors(limit: Optional[int] = None):
+#     """
+#     Fetch stored vectors (with optional limit).
+#     """
+#     try:
+#         logging.info(f"📤 /vectors called with limit={limit}")
+#         results = vector_store.get_all(limit=limit)
+#         results.pop("embeddings",None) #remove large vectors
+#         return {"status": "success", "data": results}
+    # except Exception as e:
+    #     return {"status": "error", "message": str(e)}
     
 
 
@@ -248,6 +323,16 @@ def query_text(req: QueryRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
+'''@app.post("/reset_soft")
+def reset_collection_soft():
+    try:
+        deleted = vector_store.reset_soft()
+        return {"status": "success", "message": f"Soft reset: {deleted} items deleted."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    
+
 @app.post("/reset_hard")
 def reset_collection_hard():
     """
@@ -262,7 +347,6 @@ def reset_collection_hard():
         vector_store.expected_dimension = None
         return {"status": "success", "message": "Hard reset: collection deleted and recreated."}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
-
+        return {"status": "error", "message": str(e)}'''
 
 
