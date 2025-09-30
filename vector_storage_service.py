@@ -1,13 +1,17 @@
 # store_service.py
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Dict, Optional
+
 import chromadb
 import uuid
 import logging
 import requests
-import subprocess
 import json
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+import httpx
+import threading
+import asyncio
+
 # -------------------------------------------------
 # FastAPI App Initialization
 # -------------------------------------------------
@@ -16,6 +20,11 @@ app = FastAPI(
     version="1.1",
     description="A microservice to store, retrieve, and search vectors in ChromaDB"
 )
+
+'''# Initialize Chroma client
+chroma_client = chromadb.Client()
+collection = chroma_client.get_or_create_collection("documents")
+'''
 
 # -------------------------------------------------
 # Logging Setup
@@ -45,6 +54,9 @@ class VectorStore:
         if not isinstance(metadata, dict):
             raise ValueError("Metadata must be a dictionary.")
 
+        # Normalize metadata always before storing
+        metadata = normalize_metadata(metadata)
+        
         # Check vector dimension
         if self.expected_dimension is None:
             self.expected_dimension = len(vector)
@@ -55,7 +67,8 @@ class VectorStore:
         self.collection.add(
             ids=[doc_id],
             embeddings=[vector],
-            metadatas=[metadata]
+            metadatas=[metadata],
+            documents=[metadata.get("text", "")]  # store text if available
         )
         logging.info(f"✅ Vector stored with ID {doc_id}")
         return doc_id
@@ -90,8 +103,10 @@ class VectorStore:
     #     logging.info("🧹 Soft reset: deleted %d items", len(ids))
     #     return len(ids)
     
+
 # Create a single global instance of VectorStore
 vector_store = VectorStore()
+
 
 # --- Reset collection for fresh embeddings (temporary, for testing) ---
 # all_docs = vector_store.collection.get()
@@ -140,7 +155,7 @@ def clean_user_text(raw_text: str) -> str:
 # -------------------------------------------------
 # External Embedder API
 # -------------------------------------------------
-EMBEDDER_URL = "http://127.0.0.1:8000/embed"
+EMBEDDER_URL = "http://127.0.0.1:8001/embed"
 
 def get_embedding(text: str) -> List[float]:
     """
@@ -168,6 +183,7 @@ def get_embedding(text: str) -> List[float]:
         logging.error(f"[Embedder] Invalid response format: {e}, response={resp.text}")
         raise HTTPException(status_code=500, detail=f"Embedder response error: {e}")
 
+
 def normalize_metadata(meta: dict) -> dict:
     normalized = {}
     for k, v in meta.items():
@@ -185,37 +201,108 @@ def normalize_metadata(meta: dict) -> dict:
 # -------------------------------------------------
 # Metadata Generator (via Ollama + Mistral/LLaMA)
 # -------------------------------------------------
-def generate_metadata(text: str, model: str = "mistral") -> dict:
-    prompt = f"""
-    Analyze the following text and generate metadata in strict JSON format.
-    Fields:
-    - title: short descriptive title
-    - summary: concise summary
-    - keywords: list of 3-5 important keywords
-    - category: broad category/topic
 
-    Text:
-    {text}
-    """
+# create one async client to reuse connections
+# client = httpx.AsyncClient(base_url="http://localhost:11434")
 
-    result = subprocess.run(
-        ["ollama", "run", model],
-        input=prompt,
-        text=True,
-        capture_output=True
-    )
-    raw = result.stdout.strip()
-    try:
-         # Try to extract valid JSON from messy LLM output
-        json_start = raw.find("{")
-        json_end = raw.rfind("}")
-        if json_start != -1 and json_end != -1:
-            return json.loads(raw[json_start:json_end+1])
-        return {"raw_output": raw}
-    except Exception as e:
-        logging.warning(f"[Metadata] Failed to parse JSON. Error={e}, raw={raw}")
-        return {"raw_output": raw}
+async def generate_metadata(text: str, model: str = "mistral") -> dict:
+    async with httpx.AsyncClient(base_url="http://localhost:11434") as client:
+
+        text = text[:1000] #truncate long inputs
+
+        prompt = f"""
+        Analyze the following text and generate metadata in strict JSON format.
+        Fields:
+        - title: short descriptive title
+        - summary: concise summary
+        - keywords: list of 3-5 important keywords
+        - category: broad category/topic
+
+        Text:
+        {text}
+        """
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False
+        }
+
+        try:
+            resp = await client.post("/api/generate", json=payload , timeout=60)
+            resp.raise_for_status()
+            j = resp.json() #safely retrieve response text
+            raw_output = j.get("response", "") if isinstance(j, dict) else ""
+            raw_output = (raw_output or "").strip()
+            if not raw_output:
+                logging.warning("[Metadata] Ollama returned empty response.")
+                return {"raw_output": ""}
+            # Try to parse JSON from model output
+            try:
+                return json.loads(raw_output)
+            except json.JSONDecodeError:
+                # If model includes extra text, try to extract a JSON substring
+                start = raw_output.find("{")
+                end = raw_output.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        return json.loads(raw_output[start:end+1])
+                    except Exception as e:
+                        logging.warning(f"[Metadata] failed to parse extracted JSON: {e}")
+                        return {"raw_output": raw_output}
+                # fallback
+                return {"raw_output": raw_output}
+        except Exception as e:
+            logging.error(f"[Metadata] Ollama request failed: {e}", exc_info=True)
+            return {"error": str(e), "raw_output": ""}
+
+
     
+
+# ---- Background Task ----
+async def update_metadata_in_chroma(doc_id: str, text: str, model: str = "mistral"):
+    
+    '''Background task that generates metadata and updates ChromaDB.
+    This function is async and will be scheduled with asyncio.create_task via BackgroundTasks.'''
+    try:
+        logging.info(f"🚀 Starting metadata generation for {doc_id}")
+        
+        metadata = await generate_metadata(text, model)
+        metadata["text"] = text
+        metadata["status"] = "ready"
+        # Ensure keywords are string
+        if isinstance(metadata.get("keywords"), list):
+            metadata["keywords"] = ", ".join(metadata["keywords"])
+        # Normalize before storing
+        metadata = normalize_metadata(metadata)
+
+        # 🔹 Fetch existing doc to preserve fields (like "text", "status")
+        existing = vector_store.collection.get(ids=[doc_id])
+        if not existing["ids"]:
+            logging.warning(f"❌ Document {doc_id} not found for metadata update")
+            return
+        
+        old_meta = existing["metadatas"][0] if existing["metadatas"] else {}
+
+        # Merge old + new
+        merged_meta = {**old_meta, **metadata,}
+
+        vector_store.collection.update(
+            ids=[doc_id],
+            metadatas=[merged_meta],
+            documents=[text]
+        )
+        logging.info(f"✅ Metadata updated for {doc_id}")
+    except Exception as e:
+        logging.error(f"[Metadata Update] Failed for {doc_id}: {e}", exc_info=True)
+
+
+
+def run_update_metadata(doc_id: str, text: str, model: str = "mistral"):
+    """Run async metadata update in its own thread."""
+    asyncio.run(update_metadata_in_chroma(doc_id, text, model))
+    threading.Thread(target=runner, daemon=True).start()
+
+
 # -------------------------------------------------
 # API Endpoints
 # -------------------------------------------------
@@ -231,43 +318,51 @@ def health_check():
 
 
 @app.post("/add_text")
-def add_text(req: TextRequest):
+async def add_text(req: TextRequest,background_tasks: BackgroundTasks):
     """
     Accept raw text + optional metadata, generate embedding via embedder, and store in ChromaDB.
     """
     try:
         # 🧹 Clean raw text before embedding
         clean_text = clean_user_text(req.text)
-
-        logging.info(f"📝 /add_text called with text='{req.text[:30]}...'")
-
-        vector = get_embedding(clean_text)# <-- calls embedder
         
-        # Generate metadata from LLM
-        llm_metadata = generate_metadata(clean_text, req.model)
+        if not clean_text:
+            raise HTTPException(status_code=400, detail="Input text is empty after cleaning.")  
+        logging.info(f"📝 /add_text called with text='{req.text[:30]}...'")     
+        
+        # 🔹 Generate embedding via external embedder service
+        # synchronous embedder call
+        vector = get_embedding(clean_text)# <-- calls embedder
+            
+        
 
         # Merge user-provided metadata with generated metadata
-        metadata = {**(req.metadata or {}), **(llm_metadata)}
+        metadata = req.metadata or {}
         metadata["text"] = req.text  # always store original text
+        metadata["status"] = "pending"
+
         # ✅ Normalize before storing
         metadata = normalize_metadata(metadata)
         '''# Store vector with metadata
-        metadata = req.metadata or {"text": req.text}'''
-
+            metadata = req.metadata or {"text": req.text}'''
+        
+        # 🔹 Store vector immediately
         doc_id = vector_store.store_vector(vector, metadata)
 
+        
+        # 🔹Queue metadata generation in background(runs after response is sent)
+        background_tasks.add_task(run_update_metadata, doc_id, clean_text, req.model)
+
         return {
-            "status": "success", 
-            "id": doc_id, 
-            "text": req.text,
-            "metadata":metadata
-        }
-    except HTTPException as e:
-        # Pass through HTTP errors from get_embedding
-        return {"status": "error", "message": str(e.detail)}
+                "status": "success", 
+                "id": doc_id, 
+                "text": req.text,
+                "metadata_status":"pending"
+            }
     except Exception as e:
         logging.error(f"[VectorStore] Failed to store vector: {e}")
         return {"status": "error", "message": str(e)}
+    
     
 @app.get("/vectors")
 async def list_vectors():
@@ -281,17 +376,9 @@ async def list_vectors():
             "metadata": items["metadatas"][i],   # ✅ include metadata
             # "embedding": None   # keep excluded (too large)
         })
-# def get_vectors(limit: Optional[int] = None):
-#     """
-#     Fetch stored vectors (with optional limit).
-#     """
-#     try:
-#         logging.info(f"📤 /vectors called with limit={limit}")
-#         results = vector_store.get_all(limit=limit)
-#         results.pop("embeddings",None) #remove large vectors
-#         return {"status": "success", "data": results}
-    # except Exception as e:
-    #     return {"status": "error", "message": str(e)}
+    return {"status": "success", "results": results}
+
+
     
 
 
